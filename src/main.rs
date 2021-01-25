@@ -5,6 +5,7 @@ use gstreamer as gst;
 use gstreamer_app as gst_app;
 use gstreamer_gl as gst_gl;
 use gstreamer_video as gst_video;
+use mem::MaybeUninit;
 use std::{mem, ptr, sync::Mutex, time::Duration};
 
 #[allow(clippy::unreadable_literal)]
@@ -20,29 +21,92 @@ const VS_SRC: &[u8] = b"
 #version 450
 
 layout(location=0) in vec3 a_pos;
+layout(location=1) in vec2 itx_coord;
+
+out vec2 otx_coord;
 
 void main() {
     gl_Position = vec4(a_pos, 1.0);
+    otx_coord = itx_coord;
 }
 \0";
 
+// const FS_SRC: &[u8] = b"
+// #version 450
+
+// in vec2 otx_coord;
+// out vec4 f_color;
+
+// layout(binding=0) uniform usampler2D our_texture;
+// const float LUT_MAX = float(1<<16) - 1.0;
+
+// void main() {
+//     // f_color = vec4(0.0, 1.0, 0.0, 1.0);
+//     // f_color = texture(our_texture, otx_coord);
+//     uint stored_value = texture(our_texture, otx_coord).r;
+//     float val = float(stored_value) / LUT_MAX;
+//     f_color = vec4(0.0, val, val, 1.0);
+// }
+// \0";
 const FS_SRC: &[u8] = b"
 #version 450
 
-layout(location=0) out vec4 f_color;
+in vec2 otx_coord;
+out vec4 f_color;
+
+layout(binding=0) uniform sampler2D our_texture;
+layout(binding=1) uniform sampler2D lut_texture;
+
+const float LUT_MAX = float(1<<16) - 1.0;
+const uint LOG_LUT_IMG_SIZE = 8; // The LUT-image is assumed to be 256x256 (=65536 entries)
 
 void main() {
-    f_color = vec4(0.0, 1.0, 0.0, 1.0);
+    float val = texture(our_texture, otx_coord).r;
+    uint stored_value = uint(val * LUT_MAX);
+
+    uint y = stored_value >> LOG_LUT_IMG_SIZE;
+    uint x = stored_value - (y << LOG_LUT_IMG_SIZE);
+    ivec2 lut_coord = ivec2(int(x), int(y));
+    float norm_luminance = texelFetch(lut_texture, lut_coord, 0).r;
+
+    f_color = vec4(norm_luminance, norm_luminance, norm_luminance, 1.0);
 }
 \0";
 
-#[rustfmt::skip]
-static VERTICES: [f32; 12] = [
-    -0.5_f32, -0.5_f32, 0.0_f32,
-    0.5_f32, -0.50_f32, 0.0_f32,
-    -0.5_f32, 0.5_f32, 0.0_f32,
-    0.5_f32, 0.5_f32, 0.0_f32,
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct Vertex {
+    position: [f32; 3],
+    tex_coords: [f32; 2],
+}
+unsafe impl bytemuck::Pod for Vertex {}
+unsafe impl bytemuck::Zeroable for Vertex {}
+
+static VERTICES: [Vertex; 4] = [
+    Vertex {
+        position: [-0.5, -0.5, 0.0],
+        tex_coords: [0.0, 0.0],
+    },
+    Vertex {
+        position: [0.5, -0.5, 0.0],
+        tex_coords: [1.0, 0.0],
+    },
+    Vertex {
+        position: [-0.5, 0.5, 0.0],
+        tex_coords: [0.0, 1.0],
+    },
+    Vertex {
+        position: [0.5, 0.5, 0.0],
+        tex_coords: [1.0, 1.0],
+    },
 ];
+// #[rustfmt::skip]
+// static VERTICES: [f32; 12] = [
+//     -0.5_f32, -0.5_f32, 0.0_f32,
+//     0.5_f32, -0.50_f32, 0.0_f32,
+//     -0.5_f32, 0.5_f32, 0.0_f32,
+//     0.5_f32, 0.5_f32, 0.0_f32,
+// ];
 
 static INDICES: [u16; 6] = [0, 1, 2, 1, 3, 2];
 
@@ -52,13 +116,15 @@ struct GstRenderStruct {
     vao: gl::types::GLuint,
     vertex_buffer: gl::types::GLuint,
     index_buffer: gl::types::GLuint,
+    texture_id: gl::types::GLuint,
+    lut_id: gl::types::GLuint,
 }
 
 impl GstRenderStruct {
     fn new(context: gst_gl::GLContext) -> Self {
         let bindings = gl::Gl::load_with(|name| context.get_proc_address(name) as *const _);
         println!("Loaded bindings in context");
-        let (program, vao, vertex_buffer, index_buffer) =
+        let (program, vao, vertex_buffer, index_buffer, texture_id, lut_id) =
             unsafe { Self::setup_context_resources(&bindings) };
         Self {
             bindings,
@@ -66,6 +132,8 @@ impl GstRenderStruct {
             vao,
             vertex_buffer,
             index_buffer,
+            texture_id,
+            lut_id,
         }
     }
     unsafe fn setup_context_resources(
@@ -75,14 +143,26 @@ impl GstRenderStruct {
         gl::types::GLuint,
         gl::types::GLuint,
         gl::types::GLuint,
+        gl::types::GLuint,
+        gl::types::GLuint,
     ) {
         let vs = bindings.CreateShader(gl::VERTEX_SHADER);
         bindings.ShaderSource(vs, 1, [VS_SRC.as_ptr() as *const _].as_ptr(), ptr::null());
         bindings.CompileShader(vs);
+        {
+            let mut success: gl::types::GLint = 1;
+            bindings.GetShaderiv(vs, gl::COMPILE_STATUS, &mut success);
+            assert!(success != 0);
+        }
 
         let fs = bindings.CreateShader(gl::FRAGMENT_SHADER);
         bindings.ShaderSource(fs, 1, [FS_SRC.as_ptr() as *const _].as_ptr(), ptr::null());
         bindings.CompileShader(fs);
+        {
+            let mut success: gl::types::GLint = 1;
+            bindings.GetShaderiv(fs, gl::COMPILE_STATUS, &mut success);
+            assert!(success != 0);
+        }
 
         let program = bindings.CreateProgram();
         bindings.AttachShader(program, vs);
@@ -91,7 +171,7 @@ impl GstRenderStruct {
 
         {
             let mut success: gl::types::GLint = 1;
-            bindings.GetProgramiv(fs, gl::LINK_STATUS, &mut success);
+            bindings.GetProgramiv(program, gl::LINK_STATUS, &mut success);
             assert!(success != 0);
         }
         bindings.DetachShader(program, vs);
@@ -113,9 +193,9 @@ impl GstRenderStruct {
         bindings.BindBuffer(gl::ARRAY_BUFFER, vertex_buffer);
         bindings.BufferData(
             gl::ARRAY_BUFFER,
-            (VERTICES.len() * mem::size_of::<f32>()) as _,
+            (VERTICES.len() * mem::size_of::<Vertex>()) as _,
             VERTICES.as_ptr() as _,
-            gl::STATIC_DRAW,
+            gl::STREAM_DRAW,
         );
 
         // Create Index Buffer
@@ -137,31 +217,194 @@ impl GstRenderStruct {
             3,
             gl::FLOAT,
             gl::FALSE,
-            (3 * mem::size_of::<f32>()) as _,
+            mem::size_of::<Vertex>() as _,
             ptr::null(),
         );
-
+        // Texture coords in layout=1
+        bindings.VertexAttribPointer(
+            1,
+            2,
+            gl::FLOAT,
+            gl::FALSE,
+            mem::size_of::<Vertex>() as _,
+            (3 * mem::size_of::<f32>()) as _,
+        );
         // Enable attribute 0
         bindings.EnableVertexAttribArray(0);
+        bindings.EnableVertexAttribArray(1);
 
         // Unbind the VAO BEFORE! unbinding the vertex- and index-buffers
         bindings.BindVertexArray(0);
         bindings.BindBuffer(gl::ELEMENT_ARRAY_BUFFER, 0);
         bindings.BindBuffer(gl::ARRAY_BUFFER, 0);
         bindings.DisableVertexAttribArray(0);
-        (program, vao, vertex_buffer, index_buffer)
+        bindings.DisableVertexAttribArray(1);
+
+        // Create and setup a texture
+        let mut texture_id = mem::MaybeUninit::uninit();
+        bindings.GenTextures(1, texture_id.as_mut_ptr());
+        let texture_id = texture_id.assume_init();
+        bindings.BindTexture(gl::TEXTURE_2D, texture_id);
+        // Set texture filter params
+        bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as _);
+        bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as _);
+        bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as _);
+        bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as _);
+        // Create the Texture object empty
+        bindings.TexImage2D(
+            gl::TEXTURE_2D,
+            0,
+            gl::R16 as _,
+            Self::IMAGE_WIDTH as _,
+            Self::IMAGE_HEIGHT as _,
+            0,
+            gl::RED,
+            gl::UNSIGNED_SHORT,
+            ptr::null(),
+        );
+
+        let mut lut_id = mem::MaybeUninit::uninit();
+        bindings.GenTextures(1, lut_id.as_mut_ptr());
+        let lut_id = lut_id.assume_init();
+        bindings.BindTexture(gl::TEXTURE_2D, lut_id);
+        // Set texture filter params
+        bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as _);
+        bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as _);
+        bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST as _);
+        bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::NEAREST as _);
+        // Create the Texture object empty
+        bindings.TexImage2D(
+            gl::TEXTURE_2D,
+            0,
+            gl::R16 as _,
+            256 as _,
+            256 as _,
+            0,
+            gl::RED,
+            gl::UNSIGNED_SHORT,
+            ptr::null(),
+        );
+
+        (
+            program,
+            vao,
+            vertex_buffer,
+            index_buffer,
+            texture_id,
+            lut_id,
+        )
     }
 
+    const IMAGE_WIDTH: usize = 256;
+    const IMAGE_HEIGHT: usize = 256;
+
+    fn generate_texture_data() -> Vec<u16> {
+        let data_size = Self::IMAGE_WIDTH * Self::IMAGE_HEIGHT;
+        let mut data = vec![0_u16; data_size];
+        for (y, line) in data.chunks_mut(Self::IMAGE_WIDTH).enumerate() {
+            let line_color = ((y as f32 / Self::IMAGE_HEIGHT as f32) * u16::MAX as f32) as u16;
+
+            for pixel in line.iter_mut() {
+                // pixel should have length=4 in RGBA order.
+                // *pixel = (y % u16::MAX as usize) as u16; // Green gradient
+                *pixel = line_color;
+            }
+        }
+        data
+    }
+
+    fn generate_lut_data() -> Vec<u16> {
+        let data_size = 256 * 256;
+        let mut data = vec![0_u16; data_size];
+        for (i, entry) in data.iter_mut().enumerate() {
+            let sv = (i * 3) % u16::MAX as usize;
+            *entry = sv as u16;
+        }
+        data
+    }
+
+    unsafe fn update_vertex_buffer(&self) {
+        self.bindings
+            .BindBuffer(gl::ARRAY_BUFFER, self.vertex_buffer);
+        let foo: [Vertex; 4] = [
+            Vertex {
+                position: [-0.1, -0.5, 0.0],
+                tex_coords: [0.0, 0.0],
+            },
+            Vertex {
+                position: [0.5, -0.5, 0.0],
+                tex_coords: [0.0, 0.0],
+            },
+            Vertex {
+                position: [-0.5, 0.5, 0.0],
+                tex_coords: [0.0, 0.0],
+            },
+            Vertex {
+                position: [0.5, 0.5, 0.0],
+                tex_coords: [0.0, 0.0],
+            },
+        ];
+        self.bindings.BufferData(
+            gl::ARRAY_BUFFER,
+            (mem::size_of::<Vertex>() * foo.len()) as _,
+            foo.as_ptr() as _,
+            gl::STREAM_DRAW,
+        );
+
+        self.bindings.BindBuffer(gl::ARRAY_BUFFER, 0);
+    }
+
+    unsafe fn update_texture(&self) {
+        let data = Self::generate_texture_data();
+        self.bindings.TextureSubImage2D(
+            self.texture_id,
+            0,
+            0,
+            0,
+            Self::IMAGE_WIDTH as _,
+            Self::IMAGE_HEIGHT as _,
+            gl::RED,
+            gl::UNSIGNED_SHORT,
+            data.as_ptr() as _,
+        );
+    }
+
+    unsafe fn update_lut(&self) {
+        let data = Self::generate_lut_data();
+        self.bindings.TextureSubImage2D(
+            self.lut_id,
+            0,
+            0,
+            0,
+            256 as _,
+            256 as _,
+            gl::RED,
+            gl::UNSIGNED_SHORT,
+            data.as_ptr() as _,
+        );
+    }
     unsafe fn draw(&self) {
         self.clear();
+        // Update the vertex buffer
+        // self.update_vertex_buffer();
+        self.update_texture();
+        self.update_lut();
+
         self.bindings.UseProgram(self.program); // Use our shaders
         self.bindings.BindVertexArray(self.vao); // Bind the state stored in the VAO
+
+        self.bindings.ActiveTexture(gl::TEXTURE0); // Activate texture unit 0
+        self.bindings.BindTexture(gl::TEXTURE_2D, self.texture_id);
+        self.bindings.ActiveTexture(gl::TEXTURE0 + 1);
+        self.bindings.BindTexture(gl::TEXTURE_2D, self.lut_id);
 
         self.bindings
             .DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_SHORT, ptr::null());
 
         // Unbind resources
         self.bindings.BindVertexArray(0);
+        self.bindings.BindTexture(gl::TEXTURE_2D, 0);
+        self.bindings.UseProgram(0);
     }
 
     unsafe fn clear(&self) {
