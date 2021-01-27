@@ -1,6 +1,5 @@
 use super::view_state::{Position, ViewState, Zoom};
 use cgmath::prelude::*;
-use std::mem;
 
 pub const NUM_VERTEX_COORDS: usize = 2;
 pub const NUM_TEX_COORDS: usize = 2;

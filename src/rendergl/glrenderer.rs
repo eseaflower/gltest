@@ -1,14 +1,12 @@
+use super::{bindings::gl, vertex};
 use std::{
     ffi::{c_void, CString},
     mem, ptr,
 };
-
 use vertex::Quad;
 
-use super::{bindings::gl, vertex};
-
 pub struct GlRenderer {
-    bindings: gl::MyGl,
+    bindings: gl::Gl,
     vao: u32,
     quad_vertex_buffer: u32,
     quad_index_buffer: u32,
@@ -24,7 +22,8 @@ impl GlRenderer {
         let bindings = gl::Gl::load_with(func);
         unsafe { Self::create(bindings) }
     }
-    unsafe fn create(bindings: gl::MyGl) -> Self {
+
+    unsafe fn create(bindings: gl::Gl) -> Self {
         let program_mono = Self::compile_program(
             &bindings,
             include_str!("shaders/glvert.glsl"),
@@ -41,7 +40,8 @@ impl GlRenderer {
             program_argb,
         }
     }
-    unsafe fn compile_program(bindings: &gl::MyGl, vs_src: &str, fs_src: &str) -> u32 {
+
+    unsafe fn compile_program(bindings: &gl::Gl, vs_src: &str, fs_src: &str) -> u32 {
         let vs = Self::compile_shader(bindings, vs_src, gl::VERTEX_SHADER);
         let fs = Self::compile_shader(bindings, fs_src, gl::FRAGMENT_SHADER);
 
@@ -63,7 +63,7 @@ impl GlRenderer {
     }
 
     unsafe fn compile_shader(
-        bindings: &gl::MyGl,
+        bindings: &gl::Gl,
         src: &str,
         shader_type: gl::types::GLenum,
     ) -> u32 {
@@ -79,7 +79,7 @@ impl GlRenderer {
         }
         shader
     }
-    unsafe fn create_vao(bindings: &gl::MyGl) -> (u32, u32, u32) {
+    unsafe fn create_vao(bindings: &gl::Gl) -> (u32, u32, u32) {
         // Generate Vertex Array Object, this stores buffers/pointers/indexes
         let mut vao = mem::MaybeUninit::uninit();
         bindings.GenVertexArrays(1, vao.as_mut_ptr());

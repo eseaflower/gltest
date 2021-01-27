@@ -1,14 +1,13 @@
+mod gstrender;
+mod rendergl;
+mod texture;
+
 use glib::Value;
 use glutin::{
     dpi::PhysicalSize,
     event_loop::EventLoop,
-    platform::{
-        run_return::{self, EventLoopExtRunReturn},
-        windows::RawHandle,
-        ContextTraitExt,
-    },
-    window::Window,
-    ContextWrapper, PossiblyCurrent,
+    platform::{run_return::EventLoopExtRunReturn, windows::RawHandle, ContextTraitExt},
+    PossiblyCurrent,
 };
 use gst::prelude::*;
 use gst_gl::prelude::*;
@@ -16,139 +15,44 @@ use gstreamer as gst;
 use gstreamer_app as gst_app;
 use gstreamer_gl as gst_gl;
 use gstreamer_video as gst_video;
-use mem::MaybeUninit;
-use rendergl::{bindings, vertex::Quad, view_state::ViewState};
+use gstrender::{GstRenderStruct, RenderMessage};
+use rendergl::{vertex::Quad, view_state::ViewState};
 use std::{
-    ffi::{CStr, CString},
-    mem, ptr,
     sync::{
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, Receiver},
         Mutex,
     },
     time::Duration,
 };
+use texture::TextureTransfer;
 
-mod rendergl;
-use bindings::gl;
+pub fn generate_texture_data(f: f32) -> Vec<u16> {
+    const IMAGE_WIDTH: usize = 256;
+    const IMAGE_HEIGHT: usize = 256;
+    let data_size = IMAGE_WIDTH * IMAGE_HEIGHT;
+    let mut data = vec![0_u16; data_size];
+    for (y, line) in data.chunks_mut(IMAGE_WIDTH).enumerate() {
+        let line_color = ((y as f32 * f / IMAGE_HEIGHT as f32) * u16::MAX as f32) as u16;
 
-struct GstRenderStruct {
-    renderer: rendergl::glrenderer::GlRenderer,
-    recv: Receiver<u32>,
-    img_texture: u32,
-    lut_texture: u32,
+        for pixel in line.iter_mut() {
+            // pixel should have length=4 in RGBA order.
+            // *pixel = (y % u16::MAX as usize) as u16; // Green gradient
+            *pixel = line_color;
+        }
+    }
+    data
 }
 
-impl GstRenderStruct {
-    fn new(context: gst_gl::GLContext, recv: Receiver<u32>) -> Self {
-        let (img_texture, lut_texture) = {
-            let bindings = gl::Gl::load_with(|name| context.get_proc_address(name) as *const _);
-            println!("Loaded bindings in context");
-            unsafe { Self::setup_context_resources(&bindings) }
-        };
-        let renderer = rendergl::glrenderer::GlRenderer::new(|name| {
-            context.get_proc_address(name) as *const _
-        });
-        Self {
-            renderer,
-            recv,
-            img_texture,
-            lut_texture,
-        }
+pub fn generate_lut_data() -> Vec<u16> {
+    let data_size = 256 * 256;
+    let mut data = vec![0_u16; data_size];
+    for (i, entry) in data.iter_mut().enumerate() {
+        let sv = (i * 3) % u16::MAX as usize;
+        *entry = sv as u16;
     }
-
-    unsafe fn setup_context_resources(bindings: &gl::MyGl) -> (u32, u32) {
-        // Create and setup a texture
-        let mut texture_id = mem::MaybeUninit::uninit();
-        bindings.GenTextures(1, texture_id.as_mut_ptr());
-        let texture_id = texture_id.assume_init();
-        bindings.BindTexture(gl::TEXTURE_2D, texture_id);
-        // Set texture filter params
-        bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as _);
-        bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as _);
-        bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as _);
-        bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as _);
-        let data = Self::generate_texture_data(1.0);
-        // Create the Texture object empty
-        bindings.TexImage2D(
-            gl::TEXTURE_2D,
-            0,
-            gl::R16 as _,
-            Self::IMAGE_WIDTH as _,
-            Self::IMAGE_HEIGHT as _,
-            0,
-            gl::RED,
-            gl::UNSIGNED_SHORT,
-            data.as_ptr() as _,
-        );
-
-        let mut lut_id = mem::MaybeUninit::uninit();
-        bindings.GenTextures(1, lut_id.as_mut_ptr());
-        let lut_id = lut_id.assume_init();
-        bindings.BindTexture(gl::TEXTURE_2D, lut_id);
-        // Set texture filter params
-        bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as _);
-        bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as _);
-        bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST as _);
-        bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::NEAREST as _);
-        let data = Self::generate_lut_data();
-        // Create the Texture object empty
-        bindings.TexImage2D(
-            gl::TEXTURE_2D,
-            0,
-            gl::R16 as _,
-            256 as _,
-            256 as _,
-            0,
-            gl::RED,
-            gl::UNSIGNED_SHORT,
-            data.as_ptr() as _,
-        );
-
-        (texture_id, lut_id)
-    }
-
-    pub const IMAGE_WIDTH: usize = 256;
-    pub const IMAGE_HEIGHT: usize = 256;
-
-    pub fn generate_texture_data(f: f32) -> Vec<u16> {
-        let data_size = Self::IMAGE_WIDTH * Self::IMAGE_HEIGHT;
-        let mut data = vec![0_u16; data_size];
-        for (y, line) in data.chunks_mut(Self::IMAGE_WIDTH).enumerate() {
-            let line_color = ((y as f32 * f / Self::IMAGE_HEIGHT as f32) * u16::MAX as f32) as u16;
-
-            for pixel in line.iter_mut() {
-                // pixel should have length=4 in RGBA order.
-                // *pixel = (y % u16::MAX as usize) as u16; // Green gradient
-                *pixel = line_color;
-            }
-        }
-        data
-    }
-
-    pub fn generate_lut_data() -> Vec<u16> {
-        let data_size = 256 * 256;
-        let mut data = vec![0_u16; data_size];
-        for (i, entry) in data.iter_mut().enumerate() {
-            let sv = (i * 3) % u16::MAX as usize;
-            *entry = sv as u16;
-        }
-        data
-    }
-
-    unsafe fn draw(&self) {
-        let txt_id = self.recv.recv().expect("Failed to receive texture id");
-        println!("Received texture id: {}", txt_id);
-        let mut q = Quad::with_init((256_f32, 256_f32));
-        q.map_texture_coords((256_f32, 256_f32), (256_f32, 256_f32));
-        let mut state = ViewState::new();
-        state.update_magnification(0.5);
-        let verts = q.get_vertex(&state);
-        self.renderer
-            .draw(verts.as_slice(), self.img_texture, self.lut_texture);
-    }
+    data
 }
-
-fn create_from_element(element: gst::Element, recv: Receiver<u32>) -> GstRenderStruct {
+fn create_from_element(element: gst::Element, recv: Receiver<RenderMessage>) -> GstRenderStruct {
     // We assume the element has a 'context' property which is the GLContext
     let ctx = element
         .get_property("context")
@@ -159,7 +63,7 @@ fn create_from_element(element: gst::Element, recv: Receiver<u32>) -> GstRenderS
     GstRenderStruct::new(ctx, recv)
 }
 
-fn setup_filterapp(filterapp: gst::Element, recv: Receiver<u32>) {
+fn setup_filterapp(filterapp: gst::Element, recv: Receiver<RenderMessage>) {
     let time = Mutex::new(std::time::Instant::now());
     let renderer: Mutex<Option<GstRenderStruct>> = Mutex::new(None);
     let recv = Mutex::new(Some(recv));
@@ -303,120 +207,6 @@ fn setup_context_sharing(bus: &gst::Bus) -> (EventLoop<()>, glutin::Context<Poss
     });
     (event_loop, windowed_context)
 }
-struct TextureTransfer {
-    _ctx: glutin::Context<PossiblyCurrent>, // Need to keep a ref to the context otherwise it gets deleted since it is moved in the new() method
-    bindings: gl::MyGl,
-    texture_id: gl::types::GLuint,
-}
-impl TextureTransfer {
-    pub fn new(ctx: glutin::Context<PossiblyCurrent>) -> Self {
-        let bindings = gl::Gl::load_with(|name| ctx.get_proc_address(name) as _);
-        println!("Loaded bindings for main context");
-        unsafe {
-            let version = {
-                let data = CStr::from_ptr(bindings.GetString(gl::VERSION) as *const _)
-                    .to_bytes()
-                    .to_vec();
-                String::from_utf8(data).unwrap()
-            };
-            println!("Version is: {}", version);
-
-            let mut texture_id = mem::MaybeUninit::uninit();
-            bindings.GenTextures(1, texture_id.as_mut_ptr());
-            let texture_id = texture_id.assume_init();
-            bindings.BindTexture(gl::TEXTURE_2D, texture_id);
-            // Set texture filter params
-            bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as _);
-            bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as _);
-            bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as _);
-            bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as _);
-            let data = GstRenderStruct::generate_texture_data(0.5);
-            // Create the Texture object empty
-            bindings.TexImage2D(
-                gl::TEXTURE_2D,
-                0,
-                gl::R16 as _,
-                GstRenderStruct::IMAGE_WIDTH as _,
-                GstRenderStruct::IMAGE_HEIGHT as _,
-                0,
-                gl::RED,
-                gl::UNSIGNED_SHORT,
-                data.as_ptr() as _,
-            );
-            // let data = GstRenderStruct::generate_texture_data(1.0);
-            // bindings.TexSubImage2D(
-            //     gl::TEXTURE_2D,
-            //     0,
-            //     0,
-            //     0,
-            //     GstRenderStruct::IMAGE_WIDTH as _,
-            //     GstRenderStruct::IMAGE_HEIGHT as _,
-            //     gl::RED,
-            //     gl::UNSIGNED_SHORT,
-            //     data.as_ptr() as _,
-            // );
-            bindings.BindTexture(gl::TEXTURE_2D, 0);
-            bindings.Flush();
-
-            let me = TextureTransfer {
-                bindings,
-                texture_id,
-                _ctx: ctx,
-            };
-            me.load(data);
-            me
-        }
-    }
-    fn print_version(&self) {
-        unsafe {
-            let version = {
-                let data = CStr::from_ptr(self.bindings.GetString(gl::VERSION) as *const _)
-                    .to_bytes()
-                    .to_vec();
-                String::from_utf8(data).unwrap()
-            };
-            println!("Version (func) is: {}", version);
-        };
-    }
-    pub fn get_id(&self) -> u32 {
-        self.texture_id
-    }
-
-    pub fn load(&self, data: Vec<u16>) -> u32 {
-        let data = GstRenderStruct::generate_texture_data(1.0);
-
-        unsafe {
-            self.bindings.BindTexture(gl::TEXTURE_2D, self.texture_id);
-            self.bindings.TexSubImage2D(
-                gl::TEXTURE_2D,
-                0,
-                0,
-                0,
-                GstRenderStruct::IMAGE_WIDTH as _,
-                GstRenderStruct::IMAGE_HEIGHT as _,
-                gl::RED,
-                gl::UNSIGNED_SHORT,
-                data.as_ptr() as _,
-            );
-            self.bindings.BindTexture(gl::TEXTURE_2D, 0);
-            self.bindings.Flush();
-            // self.bindings.TextureSubImage2D(
-            //     self.texture_id,
-            //     0,
-            //     0,
-            //     0,
-            //     GstRenderStruct::IMAGE_WIDTH as _,
-            //     GstRenderStruct::IMAGE_HEIGHT as _,
-            //     gl::RED,
-            //     gl::UNSIGNED_SHORT,
-            //     data.as_ptr() as _,
-            // );
-            // self.bindings.Flush();
-        }
-        // Return the used texture id.
-        self.texture_id
-    }
-}
 
 fn main() {
     gst::init().expect("GStreamer is installed");
@@ -481,11 +271,13 @@ fn main() {
     };
     // Create a texture transfer struct.
     let texture_transfer = TextureTransfer::new(window_context);
-    // println!("Context is: {:?}", &window_context);
-    // let data = GstRenderStruct::generate_texture_data(1.0);
-    // let txt_id = texture_transfer.load(data);
-    // let txt_id = texture_transfer.get_id();
     println!("Created texture transfer struct");
+    let image_data = generate_texture_data(1.0);
+    let lut_data = generate_lut_data();
+    texture_transfer.load_image((256, 256), &image_data);
+    texture_transfer.load_lut(&lut_data);
+
+    texture_transfer.flush(); // Important to flush!
 
     pipeline
         .set_state(gst::State::Playing)
@@ -495,6 +287,12 @@ fn main() {
     let target_sleep = 1000 / FPS;
 
     texture_transfer.print_version();
+
+    let mut q = Quad::with_init((256_f32, 256_f32));
+    q.map_texture_coords((256_f32, 256_f32), (256_f32, 256_f32));
+    let mut state = ViewState::new();
+    state.update_magnification(0.5);
+    let verts = q.get_vertex(&state);
 
     'main_loop: loop {
         let pt = std::time::Instant::now();
@@ -514,9 +312,14 @@ fn main() {
         last_time = std::time::Instant::now();
 
         // Simulate the upload of the image texture.
-        let txt_id = texture_transfer.get_id();
-        println!("Sending texture id: {}", txt_id);
-        snd.send(txt_id).expect("Failed to send texture id");
+        let (texture_id, lut_id) = texture_transfer.get_ids();
+        println!("Sending texture id: {}", texture_id);
+        snd.send(RenderMessage {
+            image_texture_id: texture_id,
+            lut_texture_id: lut_id,
+            vertex_data: verts.clone(),
+        })
+        .expect("Failed to send texture id");
 
         // Create a "fake" buffer and send down the pipeline
         let mut buffer = gst::Buffer::with_size(BUF_SIZE).expect("Failed to allocate new buffer");
