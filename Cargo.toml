@@ -16,7 +16,8 @@ derive_more = "0.99.5"
 glutin = "0.26"
 glib = "0.10"
 spin_sleep = "1.0"
-bytemuck = "1.4"
+cgmath = "*"
+serde = {version="1.0", features=["derive"]}
 
 [build-dependencies]
 gl_generator = { version = "0.14" }

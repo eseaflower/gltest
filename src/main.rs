@@ -1,4 +1,15 @@
 use glib::Value;
+use glutin::{
+    dpi::PhysicalSize,
+    event_loop::EventLoop,
+    platform::{
+        run_return::{self, EventLoopExtRunReturn},
+        windows::RawHandle,
+        ContextTraitExt,
+    },
+    window::Window,
+    ContextWrapper, PossiblyCurrent,
+};
 use gst::prelude::*;
 use gst_gl::prelude::*;
 use gstreamer as gst;
@@ -6,240 +17,46 @@ use gstreamer_app as gst_app;
 use gstreamer_gl as gst_gl;
 use gstreamer_video as gst_video;
 use mem::MaybeUninit;
-use std::{mem, ptr, sync::Mutex, time::Duration};
-
-#[allow(clippy::unreadable_literal)]
-#[allow(clippy::unused_unit)]
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::manual_non_exhaustive)]
-mod gl {
-    pub use self::Gl as MyGl;
-    include!("../bindings/test_gl_bindings.rs");
-}
-
-const VS_SRC: &[u8] = b"
-#version 450
-
-layout(location=0) in vec3 a_pos;
-layout(location=1) in vec2 itx_coord;
-
-out vec2 otx_coord;
-
-void main() {
-    gl_Position = vec4(a_pos, 1.0);
-    otx_coord = itx_coord;
-}
-\0";
-
-// const FS_SRC: &[u8] = b"
-// #version 450
-
-// in vec2 otx_coord;
-// out vec4 f_color;
-
-// layout(binding=0) uniform usampler2D our_texture;
-// const float LUT_MAX = float(1<<16) - 1.0;
-
-// void main() {
-//     // f_color = vec4(0.0, 1.0, 0.0, 1.0);
-//     // f_color = texture(our_texture, otx_coord);
-//     uint stored_value = texture(our_texture, otx_coord).r;
-//     float val = float(stored_value) / LUT_MAX;
-//     f_color = vec4(0.0, val, val, 1.0);
-// }
-// \0";
-const FS_SRC: &[u8] = b"
-#version 450
-
-in vec2 otx_coord;
-out vec4 f_color;
-
-layout(binding=0) uniform sampler2D our_texture;
-layout(binding=1) uniform sampler2D lut_texture;
-
-const float LUT_MAX = float(1<<16) - 1.0;
-const uint LOG_LUT_IMG_SIZE = 8; // The LUT-image is assumed to be 256x256 (=65536 entries)
-
-void main() {
-    float val = texture(our_texture, otx_coord).r;
-    uint stored_value = uint(val * LUT_MAX);
-
-    uint y = stored_value >> LOG_LUT_IMG_SIZE;
-    uint x = stored_value - (y << LOG_LUT_IMG_SIZE);
-    ivec2 lut_coord = ivec2(int(x), int(y));
-    float norm_luminance = texelFetch(lut_texture, lut_coord, 0).r;
-
-    f_color = vec4(norm_luminance, norm_luminance, norm_luminance, 1.0);
-}
-\0";
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct Vertex {
-    position: [f32; 3],
-    tex_coords: [f32; 2],
-}
-unsafe impl bytemuck::Pod for Vertex {}
-unsafe impl bytemuck::Zeroable for Vertex {}
-
-static VERTICES: [Vertex; 4] = [
-    Vertex {
-        position: [-0.5, -0.5, 0.0],
-        tex_coords: [0.0, 0.0],
+use rendergl::{bindings, vertex::Quad, view_state::ViewState};
+use std::{
+    ffi::{CStr, CString},
+    mem, ptr,
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Mutex,
     },
-    Vertex {
-        position: [0.5, -0.5, 0.0],
-        tex_coords: [1.0, 0.0],
-    },
-    Vertex {
-        position: [-0.5, 0.5, 0.0],
-        tex_coords: [0.0, 1.0],
-    },
-    Vertex {
-        position: [0.5, 0.5, 0.0],
-        tex_coords: [1.0, 1.0],
-    },
-];
-// #[rustfmt::skip]
-// static VERTICES: [f32; 12] = [
-//     -0.5_f32, -0.5_f32, 0.0_f32,
-//     0.5_f32, -0.50_f32, 0.0_f32,
-//     -0.5_f32, 0.5_f32, 0.0_f32,
-//     0.5_f32, 0.5_f32, 0.0_f32,
-// ];
+    time::Duration,
+};
 
-static INDICES: [u16; 6] = [0, 1, 2, 1, 3, 2];
+mod rendergl;
+use bindings::gl;
 
 struct GstRenderStruct {
-    bindings: gl::MyGl,
-    program: gl::types::GLuint,
-    vao: gl::types::GLuint,
-    vertex_buffer: gl::types::GLuint,
-    index_buffer: gl::types::GLuint,
-    texture_id: gl::types::GLuint,
-    lut_id: gl::types::GLuint,
+    renderer: rendergl::glrenderer::GlRenderer,
+    recv: Receiver<u32>,
+    img_texture: u32,
+    lut_texture: u32,
 }
 
 impl GstRenderStruct {
-    fn new(context: gst_gl::GLContext) -> Self {
-        let bindings = gl::Gl::load_with(|name| context.get_proc_address(name) as *const _);
-        println!("Loaded bindings in context");
-        let (program, vao, vertex_buffer, index_buffer, texture_id, lut_id) =
-            unsafe { Self::setup_context_resources(&bindings) };
+    fn new(context: gst_gl::GLContext, recv: Receiver<u32>) -> Self {
+        let (img_texture, lut_texture) = {
+            let bindings = gl::Gl::load_with(|name| context.get_proc_address(name) as *const _);
+            println!("Loaded bindings in context");
+            unsafe { Self::setup_context_resources(&bindings) }
+        };
+        let renderer = rendergl::glrenderer::GlRenderer::new(|name| {
+            context.get_proc_address(name) as *const _
+        });
         Self {
-            bindings,
-            program,
-            vao,
-            vertex_buffer,
-            index_buffer,
-            texture_id,
-            lut_id,
+            renderer,
+            recv,
+            img_texture,
+            lut_texture,
         }
     }
-    unsafe fn setup_context_resources(
-        bindings: &gl::MyGl,
-    ) -> (
-        gl::types::GLuint,
-        gl::types::GLuint,
-        gl::types::GLuint,
-        gl::types::GLuint,
-        gl::types::GLuint,
-        gl::types::GLuint,
-    ) {
-        let vs = bindings.CreateShader(gl::VERTEX_SHADER);
-        bindings.ShaderSource(vs, 1, [VS_SRC.as_ptr() as *const _].as_ptr(), ptr::null());
-        bindings.CompileShader(vs);
-        {
-            let mut success: gl::types::GLint = 1;
-            bindings.GetShaderiv(vs, gl::COMPILE_STATUS, &mut success);
-            assert!(success != 0);
-        }
 
-        let fs = bindings.CreateShader(gl::FRAGMENT_SHADER);
-        bindings.ShaderSource(fs, 1, [FS_SRC.as_ptr() as *const _].as_ptr(), ptr::null());
-        bindings.CompileShader(fs);
-        {
-            let mut success: gl::types::GLint = 1;
-            bindings.GetShaderiv(fs, gl::COMPILE_STATUS, &mut success);
-            assert!(success != 0);
-        }
-
-        let program = bindings.CreateProgram();
-        bindings.AttachShader(program, vs);
-        bindings.AttachShader(program, fs);
-        bindings.LinkProgram(program);
-
-        {
-            let mut success: gl::types::GLint = 1;
-            bindings.GetProgramiv(program, gl::LINK_STATUS, &mut success);
-            assert!(success != 0);
-        }
-        bindings.DetachShader(program, vs);
-        bindings.DeleteShader(vs);
-        bindings.DetachShader(program, fs);
-        bindings.DeleteShader(fs);
-
-        // Generate Vertex Array Object, this stores buffers/pointers/indexes
-        let mut vao = mem::MaybeUninit::uninit();
-        bindings.GenVertexArrays(1, vao.as_mut_ptr());
-        let vao = vao.assume_init();
-        // Bind the VAO (it "records" which buffers to use to draw)
-        bindings.BindVertexArray(vao);
-
-        // Create Vertex Buffer
-        let mut vertex_buffer = mem::MaybeUninit::uninit();
-        bindings.GenBuffers(1, vertex_buffer.as_mut_ptr());
-        let vertex_buffer = vertex_buffer.assume_init();
-        bindings.BindBuffer(gl::ARRAY_BUFFER, vertex_buffer);
-        bindings.BufferData(
-            gl::ARRAY_BUFFER,
-            (VERTICES.len() * mem::size_of::<Vertex>()) as _,
-            VERTICES.as_ptr() as _,
-            gl::STREAM_DRAW,
-        );
-
-        // Create Index Buffer
-        let mut index_buffer = mem::MaybeUninit::uninit();
-        bindings.GenBuffers(1, index_buffer.as_mut_ptr());
-        let index_buffer = index_buffer.assume_init();
-        bindings.BindBuffer(gl::ELEMENT_ARRAY_BUFFER, index_buffer);
-        bindings.BufferData(
-            gl::ELEMENT_ARRAY_BUFFER,
-            (INDICES.len() * mem::size_of::<u16>()) as _,
-            INDICES.as_ptr() as _,
-            gl::STATIC_DRAW,
-        );
-        // Setup attribute pointers while the VAO is bound to record this.
-
-        // The position is in layout=0 in the shader
-        bindings.VertexAttribPointer(
-            0,
-            3,
-            gl::FLOAT,
-            gl::FALSE,
-            mem::size_of::<Vertex>() as _,
-            ptr::null(),
-        );
-        // Texture coords in layout=1
-        bindings.VertexAttribPointer(
-            1,
-            2,
-            gl::FLOAT,
-            gl::FALSE,
-            mem::size_of::<Vertex>() as _,
-            (3 * mem::size_of::<f32>()) as _,
-        );
-        // Enable attribute 0
-        bindings.EnableVertexAttribArray(0);
-        bindings.EnableVertexAttribArray(1);
-
-        // Unbind the VAO BEFORE! unbinding the vertex- and index-buffers
-        bindings.BindVertexArray(0);
-        bindings.BindBuffer(gl::ELEMENT_ARRAY_BUFFER, 0);
-        bindings.BindBuffer(gl::ARRAY_BUFFER, 0);
-        bindings.DisableVertexAttribArray(0);
-        bindings.DisableVertexAttribArray(1);
-
+    unsafe fn setup_context_resources(bindings: &gl::MyGl) -> (u32, u32) {
         // Create and setup a texture
         let mut texture_id = mem::MaybeUninit::uninit();
         bindings.GenTextures(1, texture_id.as_mut_ptr());
@@ -250,6 +67,7 @@ impl GstRenderStruct {
         bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as _);
         bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as _);
         bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as _);
+        let data = Self::generate_texture_data(1.0);
         // Create the Texture object empty
         bindings.TexImage2D(
             gl::TEXTURE_2D,
@@ -260,7 +78,7 @@ impl GstRenderStruct {
             0,
             gl::RED,
             gl::UNSIGNED_SHORT,
-            ptr::null(),
+            data.as_ptr() as _,
         );
 
         let mut lut_id = mem::MaybeUninit::uninit();
@@ -272,6 +90,7 @@ impl GstRenderStruct {
         bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as _);
         bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST as _);
         bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::NEAREST as _);
+        let data = Self::generate_lut_data();
         // Create the Texture object empty
         bindings.TexImage2D(
             gl::TEXTURE_2D,
@@ -282,27 +101,20 @@ impl GstRenderStruct {
             0,
             gl::RED,
             gl::UNSIGNED_SHORT,
-            ptr::null(),
+            data.as_ptr() as _,
         );
 
-        (
-            program,
-            vao,
-            vertex_buffer,
-            index_buffer,
-            texture_id,
-            lut_id,
-        )
+        (texture_id, lut_id)
     }
 
-    const IMAGE_WIDTH: usize = 256;
-    const IMAGE_HEIGHT: usize = 256;
+    pub const IMAGE_WIDTH: usize = 256;
+    pub const IMAGE_HEIGHT: usize = 256;
 
-    fn generate_texture_data() -> Vec<u16> {
+    pub fn generate_texture_data(f: f32) -> Vec<u16> {
         let data_size = Self::IMAGE_WIDTH * Self::IMAGE_HEIGHT;
         let mut data = vec![0_u16; data_size];
         for (y, line) in data.chunks_mut(Self::IMAGE_WIDTH).enumerate() {
-            let line_color = ((y as f32 / Self::IMAGE_HEIGHT as f32) * u16::MAX as f32) as u16;
+            let line_color = ((y as f32 * f / Self::IMAGE_HEIGHT as f32) * u16::MAX as f32) as u16;
 
             for pixel in line.iter_mut() {
                 // pixel should have length=4 in RGBA order.
@@ -313,7 +125,7 @@ impl GstRenderStruct {
         data
     }
 
-    fn generate_lut_data() -> Vec<u16> {
+    pub fn generate_lut_data() -> Vec<u16> {
         let data_size = 256 * 256;
         let mut data = vec![0_u16; data_size];
         for (i, entry) in data.iter_mut().enumerate() {
@@ -323,97 +135,20 @@ impl GstRenderStruct {
         data
     }
 
-    unsafe fn update_vertex_buffer(&self) {
-        self.bindings
-            .BindBuffer(gl::ARRAY_BUFFER, self.vertex_buffer);
-        let foo: [Vertex; 4] = [
-            Vertex {
-                position: [-0.1, -0.5, 0.0],
-                tex_coords: [0.0, 0.0],
-            },
-            Vertex {
-                position: [0.5, -0.5, 0.0],
-                tex_coords: [0.0, 0.0],
-            },
-            Vertex {
-                position: [-0.5, 0.5, 0.0],
-                tex_coords: [0.0, 0.0],
-            },
-            Vertex {
-                position: [0.5, 0.5, 0.0],
-                tex_coords: [0.0, 0.0],
-            },
-        ];
-        self.bindings.BufferData(
-            gl::ARRAY_BUFFER,
-            (mem::size_of::<Vertex>() * foo.len()) as _,
-            foo.as_ptr() as _,
-            gl::STREAM_DRAW,
-        );
-
-        self.bindings.BindBuffer(gl::ARRAY_BUFFER, 0);
-    }
-
-    unsafe fn update_texture(&self) {
-        let data = Self::generate_texture_data();
-        self.bindings.TextureSubImage2D(
-            self.texture_id,
-            0,
-            0,
-            0,
-            Self::IMAGE_WIDTH as _,
-            Self::IMAGE_HEIGHT as _,
-            gl::RED,
-            gl::UNSIGNED_SHORT,
-            data.as_ptr() as _,
-        );
-    }
-
-    unsafe fn update_lut(&self) {
-        let data = Self::generate_lut_data();
-        self.bindings.TextureSubImage2D(
-            self.lut_id,
-            0,
-            0,
-            0,
-            256 as _,
-            256 as _,
-            gl::RED,
-            gl::UNSIGNED_SHORT,
-            data.as_ptr() as _,
-        );
-    }
     unsafe fn draw(&self) {
-        self.clear();
-        // Update the vertex buffer
-        // self.update_vertex_buffer();
-        self.update_texture();
-        self.update_lut();
-
-        self.bindings.UseProgram(self.program); // Use our shaders
-        self.bindings.BindVertexArray(self.vao); // Bind the state stored in the VAO
-
-        self.bindings.ActiveTexture(gl::TEXTURE0); // Activate texture unit 0
-        self.bindings.BindTexture(gl::TEXTURE_2D, self.texture_id);
-        self.bindings.ActiveTexture(gl::TEXTURE0 + 1);
-        self.bindings.BindTexture(gl::TEXTURE_2D, self.lut_id);
-
-        self.bindings
-            .DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_SHORT, ptr::null());
-
-        // Unbind resources
-        self.bindings.BindVertexArray(0);
-        self.bindings.BindTexture(gl::TEXTURE_2D, 0);
-        self.bindings.UseProgram(0);
-    }
-
-    unsafe fn clear(&self) {
-        self.bindings.ClearColor(1.0, 0.0, 0.0, 1.0);
-        self.bindings.Clear(gl::COLOR_BUFFER_BIT);
+        let txt_id = self.recv.recv().expect("Failed to receive texture id");
+        println!("Received texture id: {}", txt_id);
+        let mut q = Quad::with_init((256_f32, 256_f32));
+        q.map_texture_coords((256_f32, 256_f32), (256_f32, 256_f32));
+        let mut state = ViewState::new();
+        state.update_magnification(0.5);
+        let verts = q.get_vertex(&state);
+        self.renderer
+            .draw(verts.as_slice(), self.img_texture, self.lut_texture);
     }
 }
 
-fn create_from_element(element: gst::Element) -> GstRenderStruct {
+fn create_from_element(element: gst::Element, recv: Receiver<u32>) -> GstRenderStruct {
     // We assume the element has a 'context' property which is the GLContext
     let ctx = element
         .get_property("context")
@@ -421,12 +156,13 @@ fn create_from_element(element: gst::Element) -> GstRenderStruct {
         .get()
         .expect("Failed to convert to GLContext")
         .expect("Context is None");
-    GstRenderStruct::new(ctx)
+    GstRenderStruct::new(ctx, recv)
 }
 
-fn setup_filterapp(filterapp: gst::Element) {
+fn setup_filterapp(filterapp: gst::Element, recv: Receiver<u32>) {
     let time = Mutex::new(std::time::Instant::now());
     let renderer: Mutex<Option<GstRenderStruct>> = Mutex::new(None);
+    let recv = Mutex::new(Some(recv));
     filterapp
         .connect("client-draw", false, move |_vals| {
             let tex_id = _vals[1].get::<u32>().unwrap().unwrap();
@@ -446,7 +182,15 @@ fn setup_filterapp(filterapp: gst::Element) {
                         .expect("Value is None");
                     let name = filter_element.get_name().to_string();
                     println!("Name of element: {}", &name);
-                    *renderer = Some(create_from_element(filter_element));
+                    // UGLY HACK: The closure is Send + Sync, which means we can't use the Receiver
+                    // but we want to move it into GstRenderStruct.
+                    let recv = recv
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Can only cretae GstRenderStruct once");
+
+                    *renderer = Some(create_from_element(filter_element, recv));
                     renderer.as_ref().unwrap()
                 }
             };
@@ -464,10 +208,10 @@ fn setup_filterapp(filterapp: gst::Element) {
         .expect("Failed to connect signal handler");
 }
 
-const TX_WIDTH: u32 = 8;
-const TX_HEIGHT: u32 = 8;
+const TX_WIDTH: u32 = 1;
+const TX_HEIGHT: u32 = 1;
 const BUF_SIZE: usize = (TX_WIDTH * TX_HEIGHT * 4) as usize; // Size of one buffer (Assuming 4 channels RGBA)
-const FPS: u32 = 10;
+const FPS: u32 = 5;
 
 fn setup_appsrc(appsrc: &gst_app::AppSrc) {
     let video_info =
@@ -480,6 +224,198 @@ fn setup_appsrc(appsrc: &gst_app::AppSrc) {
             .to_caps()
             .expect("Failed to convert info to caps"),
     ));
+}
+
+fn setup_context_sharing(bus: &gst::Bus) -> (EventLoop<()>, glutin::Context<PossiblyCurrent>) {
+    let event_loop: EventLoop<()> = glutin::event_loop::EventLoop::new();
+    // let window = glutin::window::WindowBuilder::new().with_title("GL rendering");
+    let windowed_context = glutin::ContextBuilder::new()
+        // .with_vsync(true)
+        .with_gl(glutin::GlRequest::Specific(glutin::Api::OpenGl, (4, 5)))
+        .with_gl_profile(glutin::GlProfile::Core)
+        .build_headless(&event_loop, PhysicalSize::new(100, 100))
+        // .build_windowed(window, &event_loop)
+        .expect("Failed to build window");
+    let windowed_context = unsafe {
+        windowed_context
+            .make_current()
+            .expect("Failed to make context current")
+    };
+    // Build gstreamer sharable context
+    let (gl_context, gl_display, platform) = match unsafe { windowed_context.raw_handle() } {
+        RawHandle::Wgl(wgl_context) => {
+            let gl_display = gst_gl::GLDisplay::new();
+            (
+                wgl_context as usize,
+                gl_display.upcast::<gst_gl::GLDisplay>(),
+                gst_gl::GLPlatform::WGL,
+            )
+        }
+        #[allow(unreachable_patterns)]
+        handler => panic!("Unsupported platform: {:?}.", handler),
+    };
+    // The shared gstreamer context will be moved into the sync bus handler.
+    let shared_context = unsafe {
+        gst_gl::GLContext::new_wrapped(&gl_display, gl_context, platform, gst_gl::GLAPI::OPENGL3)
+    }
+    .unwrap();
+
+    shared_context
+        .activate(true)
+        .expect("Couldn't activate wrapped GL context");
+
+    shared_context
+        .fill_info()
+        .expect("Failed to fill context info");
+
+    #[allow(clippy::single_match)]
+    bus.set_sync_handler(move |_, msg| {
+        match msg.view() {
+            gst::MessageView::NeedContext(ctxt) => {
+                println!("Got context message");
+                let context_type = ctxt.get_context_type();
+                if context_type == *gst_gl::GL_DISPLAY_CONTEXT_TYPE {
+                    println!("Ignoring display");
+                    // if let Some(el) = msg.get_src().map(|s| s.downcast::<gst::Element>().unwrap()) {
+                    //     println!("Display context");
+                    //     let context = gst::Context::new(context_type, true);
+                    //     context.set_gl_display(&gl_display);
+                    //     el.set_context(&context);
+                    // }
+                }
+                if context_type == "gst.gl.app_context" {
+                    if let Some(el) = msg.get_src().map(|s| s.downcast::<gst::Element>().unwrap()) {
+                        println!("App context");
+                        let mut context = gst::Context::new(context_type, true);
+                        {
+                            let context = context.get_mut().unwrap();
+                            let s = context.get_mut_structure();
+                            s.set("context", &shared_context);
+                        }
+                        el.set_context(&context);
+                    }
+                }
+            }
+            _ => (),
+        }
+
+        gst::BusSyncReply::Pass
+    });
+    (event_loop, windowed_context)
+}
+struct TextureTransfer {
+    _ctx: glutin::Context<PossiblyCurrent>, // Need to keep a ref to the context otherwise it gets deleted since it is moved in the new() method
+    bindings: gl::MyGl,
+    texture_id: gl::types::GLuint,
+}
+impl TextureTransfer {
+    pub fn new(ctx: glutin::Context<PossiblyCurrent>) -> Self {
+        let bindings = gl::Gl::load_with(|name| ctx.get_proc_address(name) as _);
+        println!("Loaded bindings for main context");
+        unsafe {
+            let version = {
+                let data = CStr::from_ptr(bindings.GetString(gl::VERSION) as *const _)
+                    .to_bytes()
+                    .to_vec();
+                String::from_utf8(data).unwrap()
+            };
+            println!("Version is: {}", version);
+
+            let mut texture_id = mem::MaybeUninit::uninit();
+            bindings.GenTextures(1, texture_id.as_mut_ptr());
+            let texture_id = texture_id.assume_init();
+            bindings.BindTexture(gl::TEXTURE_2D, texture_id);
+            // Set texture filter params
+            bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as _);
+            bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as _);
+            bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as _);
+            bindings.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as _);
+            let data = GstRenderStruct::generate_texture_data(0.5);
+            // Create the Texture object empty
+            bindings.TexImage2D(
+                gl::TEXTURE_2D,
+                0,
+                gl::R16 as _,
+                GstRenderStruct::IMAGE_WIDTH as _,
+                GstRenderStruct::IMAGE_HEIGHT as _,
+                0,
+                gl::RED,
+                gl::UNSIGNED_SHORT,
+                data.as_ptr() as _,
+            );
+            // let data = GstRenderStruct::generate_texture_data(1.0);
+            // bindings.TexSubImage2D(
+            //     gl::TEXTURE_2D,
+            //     0,
+            //     0,
+            //     0,
+            //     GstRenderStruct::IMAGE_WIDTH as _,
+            //     GstRenderStruct::IMAGE_HEIGHT as _,
+            //     gl::RED,
+            //     gl::UNSIGNED_SHORT,
+            //     data.as_ptr() as _,
+            // );
+            bindings.BindTexture(gl::TEXTURE_2D, 0);
+            bindings.Flush();
+
+            let me = TextureTransfer {
+                bindings,
+                texture_id,
+                _ctx: ctx,
+            };
+            me.load(data);
+            me
+        }
+    }
+    fn print_version(&self) {
+        unsafe {
+            let version = {
+                let data = CStr::from_ptr(self.bindings.GetString(gl::VERSION) as *const _)
+                    .to_bytes()
+                    .to_vec();
+                String::from_utf8(data).unwrap()
+            };
+            println!("Version (func) is: {}", version);
+        };
+    }
+    pub fn get_id(&self) -> u32 {
+        self.texture_id
+    }
+
+    pub fn load(&self, data: Vec<u16>) -> u32 {
+        let data = GstRenderStruct::generate_texture_data(1.0);
+
+        unsafe {
+            self.bindings.BindTexture(gl::TEXTURE_2D, self.texture_id);
+            self.bindings.TexSubImage2D(
+                gl::TEXTURE_2D,
+                0,
+                0,
+                0,
+                GstRenderStruct::IMAGE_WIDTH as _,
+                GstRenderStruct::IMAGE_HEIGHT as _,
+                gl::RED,
+                gl::UNSIGNED_SHORT,
+                data.as_ptr() as _,
+            );
+            self.bindings.BindTexture(gl::TEXTURE_2D, 0);
+            self.bindings.Flush();
+            // self.bindings.TextureSubImage2D(
+            //     self.texture_id,
+            //     0,
+            //     0,
+            //     0,
+            //     GstRenderStruct::IMAGE_WIDTH as _,
+            //     GstRenderStruct::IMAGE_HEIGHT as _,
+            //     gl::RED,
+            //     gl::UNSIGNED_SHORT,
+            //     data.as_ptr() as _,
+            // );
+            // self.bindings.Flush();
+        }
+        // Return the used texture id.
+        self.texture_id
+    }
 }
 
 fn main() {
@@ -500,11 +436,15 @@ fn main() {
         .expect("Should be a pipeline element");
     let bus = pipeline.get_bus().expect("Bus is present");
 
+    let (mut event_loop, window_context) = setup_context_sharing(&bus);
+    println!("Context sharing setup");
+
     // We should now be able to get the filterapp and its GLContext
     let filterapp = pipeline
         .get_by_name("filterapp")
         .expect("Failed to find filterapp-name");
-    setup_filterapp(filterapp);
+    let (snd, recv) = mpsc::channel();
+    setup_filterapp(filterapp, recv);
 
     let appsrc = pipeline
         .get_by_name("app")
@@ -515,6 +455,37 @@ fn main() {
 
     // Uncurrent the "main" GL context and start the pipeline
     // The set to current again once the contexts have been shared.
+    let window_context = unsafe {
+        window_context
+            .make_not_current()
+            .expect("Failed to uncurrent the window context")
+    };
+
+    pipeline
+        .set_state(gst::State::Paused)
+        .expect("Failed to set the pipeline to paused");
+    let (result, _s1, _s2) = pipeline.get_state(gst::ClockTime::none());
+    println!("In paused state?");
+    match result {
+        Ok(_) => {
+            println!("Yaya");
+        }
+        Err(e) => {
+            println!("Fail: {:?}", e);
+        }
+    }
+    let window_context = unsafe {
+        window_context
+            .make_current()
+            .expect("Failed to recurrent the window context")
+    };
+    // Create a texture transfer struct.
+    let texture_transfer = TextureTransfer::new(window_context);
+    // println!("Context is: {:?}", &window_context);
+    // let data = GstRenderStruct::generate_texture_data(1.0);
+    // let txt_id = texture_transfer.load(data);
+    // let txt_id = texture_transfer.get_id();
+    println!("Created texture transfer struct");
 
     pipeline
         .set_state(gst::State::Playing)
@@ -522,7 +493,18 @@ fn main() {
 
     let mut last_time = std::time::Instant::now();
     let target_sleep = 1000 / FPS;
+
+    texture_transfer.print_version();
+
     'main_loop: loop {
+        let pt = std::time::Instant::now();
+        event_loop.run_return(|_, _, flow| {
+            // println!("Inside message handler");
+            // Just make sure to pop off any window messages, we really don't care
+            *flow = glutin::event_loop::ControlFlow::Exit;
+        });
+        println!("WinMsg took {} ms", pt.elapsed().as_millis());
+
         let now = std::time::Instant::now();
         let sleep_time = target_sleep as i32 - (now - last_time).as_millis() as i32;
         println!("Sleeping for: {}", sleep_time);
@@ -531,21 +513,14 @@ fn main() {
         spin_sleep::sleep(Duration::from_millis(sleep_time));
         last_time = std::time::Instant::now();
 
-        // Create a "fake" buffer and send down the pipeline
-        // let mut buffer = gst::Buffer::with_size(BUF_SIZE).expect("Failed to allocate new buffer");
-        let mut data = vec![0; BUF_SIZE];
-        let data_slice = &mut data[..];
-        for y in 0..TX_HEIGHT / 2 {
-            for x in 0..TX_WIDTH / 2 {
-                let idx = (y * TX_WIDTH * 4 + x * 4) as usize;
-                data_slice[idx] = 200;
-                data_slice[idx + 1] = 200;
-                data_slice[idx + 2] = 200;
-                data_slice[idx + 3] = 200;
-            }
-        }
+        // Simulate the upload of the image texture.
+        let txt_id = texture_transfer.get_id();
+        println!("Sending texture id: {}", txt_id);
+        snd.send(txt_id).expect("Failed to send texture id");
 
-        let mut buffer = gst::Buffer::from_slice(data);
+        // Create a "fake" buffer and send down the pipeline
+        let mut buffer = gst::Buffer::with_size(BUF_SIZE).expect("Failed to allocate new buffer");
+
         let buffer_ref = buffer.get_mut().expect("Failed to get BufferRef");
         gst_video::video_meta::VideoMeta::add(
             buffer_ref,
@@ -571,6 +546,12 @@ fn main() {
             }
         }
     }
+    // Make sure the window_context lives for the duration of the program.
+    // let _ = unsafe {
+    //     window_context
+    //         .make_not_current()
+    //         .expect("Failed to uncurrent context")
+    // };
     pipeline.send_event(gst::event::Eos::new());
     pipeline
         .set_state(gst::State::Null)
