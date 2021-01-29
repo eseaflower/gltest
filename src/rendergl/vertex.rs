@@ -26,19 +26,19 @@ impl Quad {
     pub const VERTICES: [Vertex; 4] = [
         Vertex {
             position: [0.0, 0.0],
-            tex_coords: [0.0, 0.0],
+            tex_coords: [0.0, 1.0], // Note that we need to flip the y-axis in OpenGL
         },
         Vertex {
             position: [0.0, 1.0],
-            tex_coords: [0.0, 1.0],
+            tex_coords: [0.0, 0.0],
         },
         Vertex {
             position: [1.0, 1.0],
-            tex_coords: [1.0, 1.0],
+            tex_coords: [1.0, 0.0],
         },
         Vertex {
             position: [1.0, 0.0],
-            tex_coords: [1.0, 0.0],
+            tex_coords: [1.0, 1.0],
         },
     ];
     pub const INDICES: [u16; 6] = [0, 1, 2, 0, 2, 3];

@@ -1,14 +1,11 @@
+mod bidir;
 mod gstrender;
 mod rendergl;
 mod texture;
 
+use bidir::BidirChannel;
 use glib::Value;
-use glutin::{
-    dpi::PhysicalSize,
-    event_loop::EventLoop,
-    platform::{run_return::EventLoopExtRunReturn, windows::RawHandle, ContextTraitExt},
-    PossiblyCurrent,
-};
+use glutin::{PossiblyCurrent, dpi::PhysicalSize, event::Event, event_loop::{ControlFlow, EventLoop}, platform::{run_return::EventLoopExtRunReturn, windows::RawHandle, ContextTraitExt}};
 use gst::prelude::*;
 use gst_gl::prelude::*;
 use gstreamer as gst;
@@ -17,6 +14,7 @@ use gstreamer_gl as gst_gl;
 use gstreamer_video as gst_video;
 use gstrender::{GstRenderStruct, RenderMessage};
 use rendergl::{vertex::Quad, view_state::ViewState};
+use core::time;
 use std::{
     sync::{
         mpsc::{self, Receiver},
@@ -26,17 +24,14 @@ use std::{
 };
 use texture::TextureTransfer;
 
+const IMAGE_WIDTH: usize = 256;
+const IMAGE_HEIGHT: usize = 256;
 pub fn generate_texture_data(f: f32) -> Vec<u16> {
-    const IMAGE_WIDTH: usize = 256;
-    const IMAGE_HEIGHT: usize = 256;
     let data_size = IMAGE_WIDTH * IMAGE_HEIGHT;
     let mut data = vec![0_u16; data_size];
     for (y, line) in data.chunks_mut(IMAGE_WIDTH).enumerate() {
         let line_color = ((y as f32 * f / IMAGE_HEIGHT as f32) * u16::MAX as f32) as u16;
-
         for pixel in line.iter_mut() {
-            // pixel should have length=4 in RGBA order.
-            // *pixel = (y % u16::MAX as usize) as u16; // Green gradient
             *pixel = line_color;
         }
     }
@@ -47,12 +42,15 @@ pub fn generate_lut_data() -> Vec<u16> {
     let data_size = 256 * 256;
     let mut data = vec![0_u16; data_size];
     for (i, entry) in data.iter_mut().enumerate() {
-        let sv = (i * 3) % u16::MAX as usize;
+        let sv = (i) % u16::MAX as usize;
         *entry = sv as u16;
     }
     data
 }
-fn create_from_element(element: gst::Element, recv: Receiver<RenderMessage>) -> GstRenderStruct {
+fn create_from_element(
+    element: gst::Element,
+    channel: BidirChannel<RenderMessage>,
+) -> GstRenderStruct {
     // We assume the element has a 'context' property which is the GLContext
     let ctx = element
         .get_property("context")
@@ -60,17 +58,17 @@ fn create_from_element(element: gst::Element, recv: Receiver<RenderMessage>) -> 
         .get()
         .expect("Failed to convert to GLContext")
         .expect("Context is None");
-    GstRenderStruct::new(ctx, recv)
+    GstRenderStruct::new(ctx, channel)
 }
 
-fn setup_filterapp(filterapp: gst::Element, recv: Receiver<RenderMessage>) {
+fn setup_filterapp(filterapp: gst::Element, channel: BidirChannel<RenderMessage>) {
     let time = Mutex::new(std::time::Instant::now());
     let renderer: Mutex<Option<GstRenderStruct>> = Mutex::new(None);
-    let recv = Mutex::new(Some(recv));
+    let channel = Mutex::new(Some(channel));
     filterapp
         .connect("client-draw", false, move |_vals| {
-            let tex_id = _vals[1].get::<u32>().unwrap().unwrap();
-            println!("Texture id: {}", tex_id);
+            // let tex_id = _vals[1].get::<u32>().unwrap().unwrap();
+            // println!("Texture id: {}", tex_id);
             // let tex_width = _vals[2].get::<u32>().unwrap().unwrap();
             // println!("Texture width: {}", tex_width);
             // let tex_height = _vals[3].get::<u32>().unwrap().unwrap();
@@ -88,13 +86,13 @@ fn setup_filterapp(filterapp: gst::Element, recv: Receiver<RenderMessage>) {
                     println!("Name of element: {}", &name);
                     // UGLY HACK: The closure is Send + Sync, which means we can't use the Receiver
                     // but we want to move it into GstRenderStruct.
-                    let recv = recv
+                    let channel = channel
                         .lock()
                         .unwrap()
                         .take()
                         .expect("Can only cretae GstRenderStruct once");
 
-                    *renderer = Some(create_from_element(filter_element, recv));
+                    *renderer = Some(create_from_element(filter_element, channel));
                     renderer.as_ref().unwrap()
                 }
             };
@@ -233,8 +231,10 @@ fn main() {
     let filterapp = pipeline
         .get_by_name("filterapp")
         .expect("Failed to find filterapp-name");
-    let (snd, recv) = mpsc::channel();
-    setup_filterapp(filterapp, recv);
+
+    // Create a bidirectional channel to communicate with the render thread.
+    let (channel, other) = BidirChannel::new_pair();
+    setup_filterapp(filterapp, other);
 
     let appsrc = pipeline
         .get_by_name("app")
@@ -270,14 +270,8 @@ fn main() {
             .expect("Failed to recurrent the window context")
     };
     // Create a texture transfer struct.
-    let texture_transfer = TextureTransfer::new(window_context);
+    let mut texture_transfer = TextureTransfer::new(window_context);
     println!("Created texture transfer struct");
-    let image_data = generate_texture_data(1.0);
-    let lut_data = generate_lut_data();
-    texture_transfer.load_image((256, 256), &image_data);
-    texture_transfer.load_lut(&lut_data);
-
-    texture_transfer.flush(); // Important to flush!
 
     pipeline
         .set_state(gst::State::Playing)
@@ -289,19 +283,28 @@ fn main() {
     texture_transfer.print_version();
 
     let mut q = Quad::with_init((256_f32, 256_f32));
-    q.map_texture_coords((256_f32, 256_f32), (256_f32, 256_f32));
     let mut state = ViewState::new();
     state.update_magnification(0.5);
-    let verts = q.get_vertex(&state);
+
+    // let mut timer = std::time::Instant::now();
+    // event_loop.run(move |ev, t, flow| {
+    //     *flow = ControlFlow::Poll;
+    //     println!("Loop time: {} ms", timer.elapsed().as_millis());
+    //     timer = std::time::Instant::now();
+    //     spin_sleep::sleep(Duration::from_millis(10));
+    // });
+
+    // todo!();
+
 
     'main_loop: loop {
-        let pt = std::time::Instant::now();
-        event_loop.run_return(|_, _, flow| {
-            // println!("Inside message handler");
-            // Just make sure to pop off any window messages, we really don't care
-            *flow = glutin::event_loop::ControlFlow::Exit;
-        });
-        println!("WinMsg took {} ms", pt.elapsed().as_millis());
+        // let pt = std::time::Instant::now();
+        // event_loop.run_return(|_el, _t, flow| {
+        //     println!("Inside message handler {:?}", _el);
+        //     // Just make sure to pop off any window messages, we really don't care
+        //     *flow = glutin::event_loop::ControlFlow::Exit;
+        // });
+        // println!("WinMsg took {} ms", pt.elapsed().as_millis());
 
         let now = std::time::Instant::now();
         let sleep_time = target_sleep as i32 - (now - last_time).as_millis() as i32;
@@ -311,15 +314,57 @@ fn main() {
         spin_sleep::sleep(Duration::from_millis(sleep_time));
         last_time = std::time::Instant::now();
 
+        // Start by looking for messages from the render thread
+        if let Ok(from_renderer) = channel.try_recv() {
+            // This signals that the renderer has completed this message
+
+            // NOTE: We should perhaps not release the texture directly
+            // we might do several renders on the same image!
+            texture_transfer.release_texture(from_renderer.image_texture);
+            texture_transfer.release_texture(from_renderer.lut_texture);
+        }
+
+        // This simulates that we actually should load new texture data
+        let image_data = generate_texture_data(1.0);
+        let lut_data = generate_lut_data();
+
+        // Try to get a texture to use for upload
+        let image_texture = loop {
+            if let Some(texture) =
+                texture_transfer.load_image((IMAGE_WIDTH, IMAGE_HEIGHT), &image_data)
+            {
+                break texture;
+            }
+            let from_renderer = channel.recv().expect("Failed to get message from renderer");
+            texture_transfer.release_texture(from_renderer.image_texture);
+            texture_transfer.release_texture(from_renderer.lut_texture);
+        };
+        let lut_texture = loop {
+            if let Some(texture) = texture_transfer.load_lut(&lut_data) {
+                break texture;
+            }
+            let from_renderer = channel.recv().expect("Failed to get message from renderer");
+            texture_transfer.release_texture(from_renderer.image_texture);
+            texture_transfer.release_texture(from_renderer.lut_texture);
+        };
+
+        texture_transfer.flush(); // Important to flush!
+
+        // Remap the texture coordinates if we have changed texture size
+        q.map_texture_coords(
+            (IMAGE_WIDTH as f32, IMAGE_HEIGHT as f32),
+            (image_texture.width as f32, image_texture.height as f32),
+        );
+        let vertex_data = q.get_vertex(&state);
+
         // Simulate the upload of the image texture.
-        let (texture_id, lut_id) = texture_transfer.get_ids();
-        println!("Sending texture id: {}", texture_id);
-        snd.send(RenderMessage {
-            image_texture_id: texture_id,
-            lut_texture_id: lut_id,
-            vertex_data: verts.clone(),
-        })
-        .expect("Failed to send texture id");
+        channel
+            .send(RenderMessage {
+                image_texture,
+                lut_texture,
+                vertex_data,
+            })
+            .expect("Failed to send textures");
 
         // Create a "fake" buffer and send down the pipeline
         let mut buffer = gst::Buffer::with_size(BUF_SIZE).expect("Failed to allocate new buffer");
@@ -349,12 +394,6 @@ fn main() {
             }
         }
     }
-    // Make sure the window_context lives for the duration of the program.
-    // let _ = unsafe {
-    //     window_context
-    //         .make_not_current()
-    //         .expect("Failed to uncurrent context")
-    // };
     pipeline.send_event(gst::event::Eos::new());
     pipeline
         .set_state(gst::State::Null)
