@@ -4,17 +4,23 @@ mod rendergl;
 mod texture;
 
 use bidir::BidirChannel;
+use core::time;
 use glib::Value;
-use glutin::{PossiblyCurrent, dpi::PhysicalSize, event::Event, event_loop::{ControlFlow, EventLoop}, platform::{run_return::EventLoopExtRunReturn, windows::RawHandle, ContextTraitExt}};
+use glutin::{
+    dpi::PhysicalSize,
+    event::Event,
+    event_loop::{ControlFlow, EventLoop},
+    platform::{run_return::EventLoopExtRunReturn, windows::RawHandle, ContextTraitExt},
+    PossiblyCurrent,
+};
 use gst::prelude::*;
 use gst_gl::prelude::*;
 use gstreamer as gst;
 use gstreamer_app as gst_app;
 use gstreamer_gl as gst_gl;
 use gstreamer_video as gst_video;
-use gstrender::{GstRenderStruct, RenderMessage};
+use gstrender::{GstRenderStruct, GstRenderMessage};
 use rendergl::{vertex::Quad, view_state::ViewState};
-use core::time;
 use std::{
     sync::{
         mpsc::{self, Receiver},
@@ -22,7 +28,7 @@ use std::{
     },
     time::Duration,
 };
-use texture::TextureTransfer;
+use texture::ThreadUploader;
 
 const IMAGE_WIDTH: usize = 256;
 const IMAGE_HEIGHT: usize = 256;
@@ -49,7 +55,7 @@ pub fn generate_lut_data() -> Vec<u16> {
 }
 fn create_from_element(
     element: gst::Element,
-    channel: BidirChannel<RenderMessage>,
+    channel: BidirChannel<GstRenderMessage>,
 ) -> GstRenderStruct {
     // We assume the element has a 'context' property which is the GLContext
     let ctx = element
@@ -61,7 +67,7 @@ fn create_from_element(
     GstRenderStruct::new(ctx, channel)
 }
 
-fn setup_filterapp(filterapp: gst::Element, channel: BidirChannel<RenderMessage>) {
+fn setup_filterapp(filterapp: gst::Element, channel: BidirChannel<GstRenderMessage>) {
     let time = Mutex::new(std::time::Instant::now());
     let renderer: Mutex<Option<GstRenderStruct>> = Mutex::new(None);
     let channel = Mutex::new(Some(channel));
@@ -128,63 +134,13 @@ fn setup_appsrc(appsrc: &gst_app::AppSrc) {
     ));
 }
 
-fn setup_context_sharing(bus: &gst::Bus) -> (EventLoop<()>, glutin::Context<PossiblyCurrent>) {
-    let event_loop: EventLoop<()> = glutin::event_loop::EventLoop::new();
-    // let window = glutin::window::WindowBuilder::new().with_title("GL rendering");
-    let windowed_context = glutin::ContextBuilder::new()
-        // .with_vsync(true)
-        .with_gl(glutin::GlRequest::Specific(glutin::Api::OpenGl, (4, 5)))
-        .with_gl_profile(glutin::GlProfile::Core)
-        .build_headless(&event_loop, PhysicalSize::new(100, 100))
-        // .build_windowed(window, &event_loop)
-        .expect("Failed to build window");
-    let windowed_context = unsafe {
-        windowed_context
-            .make_current()
-            .expect("Failed to make context current")
-    };
-    // Build gstreamer sharable context
-    let (gl_context, gl_display, platform) = match unsafe { windowed_context.raw_handle() } {
-        RawHandle::Wgl(wgl_context) => {
-            let gl_display = gst_gl::GLDisplay::new();
-            (
-                wgl_context as usize,
-                gl_display.upcast::<gst_gl::GLDisplay>(),
-                gst_gl::GLPlatform::WGL,
-            )
-        }
-        #[allow(unreachable_patterns)]
-        handler => panic!("Unsupported platform: {:?}.", handler),
-    };
-    // The shared gstreamer context will be moved into the sync bus handler.
-    let shared_context = unsafe {
-        gst_gl::GLContext::new_wrapped(&gl_display, gl_context, platform, gst_gl::GLAPI::OPENGL3)
-    }
-    .unwrap();
-
-    shared_context
-        .activate(true)
-        .expect("Couldn't activate wrapped GL context");
-
-    shared_context
-        .fill_info()
-        .expect("Failed to fill context info");
-
+fn set_sync_bus_handler(bus: &gst::Bus, shared_context: gst_gl::GLContext) {
     #[allow(clippy::single_match)]
     bus.set_sync_handler(move |_, msg| {
         match msg.view() {
             gst::MessageView::NeedContext(ctxt) => {
                 println!("Got context message");
                 let context_type = ctxt.get_context_type();
-                if context_type == *gst_gl::GL_DISPLAY_CONTEXT_TYPE {
-                    println!("Ignoring display");
-                    // if let Some(el) = msg.get_src().map(|s| s.downcast::<gst::Element>().unwrap()) {
-                    //     println!("Display context");
-                    //     let context = gst::Context::new(context_type, true);
-                    //     context.set_gl_display(&gl_display);
-                    //     el.set_context(&context);
-                    // }
-                }
                 if context_type == "gst.gl.app_context" {
                     if let Some(el) = msg.get_src().map(|s| s.downcast::<gst::Element>().unwrap()) {
                         println!("App context");
@@ -203,7 +159,6 @@ fn setup_context_sharing(bus: &gst::Bus) -> (EventLoop<()>, glutin::Context<Poss
 
         gst::BusSyncReply::Pass
     });
-    (event_loop, windowed_context)
 }
 
 fn main() {
@@ -224,7 +179,9 @@ fn main() {
         .expect("Should be a pipeline element");
     let bus = pipeline.get_bus().expect("Bus is present");
 
-    let (mut event_loop, window_context) = setup_context_sharing(&bus);
+    let uploader = ThreadUploader::new();
+    let shared_context = uploader.get_shared_context();
+    set_sync_bus_handler(&bus, shared_context);
     println!("Context sharing setup");
 
     // We should now be able to get the filterapp and its GLContext
@@ -243,14 +200,6 @@ fn main() {
         .expect("Failed to cast to AppSrc");
     setup_appsrc(&appsrc);
 
-    // Uncurrent the "main" GL context and start the pipeline
-    // The set to current again once the contexts have been shared.
-    let window_context = unsafe {
-        window_context
-            .make_not_current()
-            .expect("Failed to uncurrent the window context")
-    };
-
     pipeline
         .set_state(gst::State::Paused)
         .expect("Failed to set the pipeline to paused");
@@ -264,14 +213,8 @@ fn main() {
             println!("Fail: {:?}", e);
         }
     }
-    let window_context = unsafe {
-        window_context
-            .make_current()
-            .expect("Failed to recurrent the window context")
-    };
-    // Create a texture transfer struct.
-    let mut texture_transfer = TextureTransfer::new(window_context);
-    println!("Created texture transfer struct");
+    // Signal that the uploader can set its context as current
+    uploader.set_current();
 
     pipeline
         .set_state(gst::State::Playing)
@@ -280,32 +223,32 @@ fn main() {
     let mut last_time = std::time::Instant::now();
     let target_sleep = 1000 / FPS;
 
-    texture_transfer.print_version();
-
     let mut q = Quad::with_init((256_f32, 256_f32));
     let mut state = ViewState::new();
     state.update_magnification(0.5);
+    let image_texture = uploader
+        .acquire_image_handle((IMAGE_WIDTH, IMAGE_HEIGHT))
+        .expect("Failed to acquire image texture");
+    let lut_texture = uploader
+        .acquire_lut_handle()
+        .expect("Failed to acquire lut texture");
 
-    // let mut timer = std::time::Instant::now();
-    // event_loop.run(move |ev, t, flow| {
-    //     *flow = ControlFlow::Poll;
-    //     println!("Loop time: {} ms", timer.elapsed().as_millis());
-    //     timer = std::time::Instant::now();
-    //     spin_sleep::sleep(Duration::from_millis(10));
-    // });
+    // This simulates that we actually should load new texture data
+    let image_data = generate_texture_data(1.0);
+    let lut_data = generate_lut_data();
+    uploader.load_image(&image_texture, (IMAGE_WIDTH, IMAGE_HEIGHT), image_data);
+    uploader.load_lut(&lut_texture, lut_data);
+    q.map_texture_coords(
+        (IMAGE_WIDTH as f32, IMAGE_HEIGHT as f32),
+        (
+            image_texture.handle.width as f32,
+            image_texture.handle.height as f32,
+        ),
+    );
 
-    // todo!();
-
+    uploader.flush();
 
     'main_loop: loop {
-        // let pt = std::time::Instant::now();
-        // event_loop.run_return(|_el, _t, flow| {
-        //     println!("Inside message handler {:?}", _el);
-        //     // Just make sure to pop off any window messages, we really don't care
-        //     *flow = glutin::event_loop::ControlFlow::Exit;
-        // });
-        // println!("WinMsg took {} ms", pt.elapsed().as_millis());
-
         let now = std::time::Instant::now();
         let sleep_time = target_sleep as i32 - (now - last_time).as_millis() as i32;
         println!("Sleeping for: {}", sleep_time);
@@ -314,54 +257,16 @@ fn main() {
         spin_sleep::sleep(Duration::from_millis(sleep_time));
         last_time = std::time::Instant::now();
 
-        // Start by looking for messages from the render thread
-        if let Ok(from_renderer) = channel.try_recv() {
-            // This signals that the renderer has completed this message
-
-            // NOTE: We should perhaps not release the texture directly
-            // we might do several renders on the same image!
-            texture_transfer.release_texture(from_renderer.image_texture);
-            texture_transfer.release_texture(from_renderer.lut_texture);
-        }
-
-        // This simulates that we actually should load new texture data
-        let image_data = generate_texture_data(1.0);
-        let lut_data = generate_lut_data();
-
         // Try to get a texture to use for upload
-        let image_texture = loop {
-            if let Some(texture) =
-                texture_transfer.load_image((IMAGE_WIDTH, IMAGE_HEIGHT), &image_data)
-            {
-                break texture;
-            }
-            let from_renderer = channel.recv().expect("Failed to get message from renderer");
-            texture_transfer.release_texture(from_renderer.image_texture);
-            texture_transfer.release_texture(from_renderer.lut_texture);
-        };
-        let lut_texture = loop {
-            if let Some(texture) = texture_transfer.load_lut(&lut_data) {
-                break texture;
-            }
-            let from_renderer = channel.recv().expect("Failed to get message from renderer");
-            texture_transfer.release_texture(from_renderer.image_texture);
-            texture_transfer.release_texture(from_renderer.lut_texture);
-        };
-
-        texture_transfer.flush(); // Important to flush!
 
         // Remap the texture coordinates if we have changed texture size
-        q.map_texture_coords(
-            (IMAGE_WIDTH as f32, IMAGE_HEIGHT as f32),
-            (image_texture.width as f32, image_texture.height as f32),
-        );
         let vertex_data = q.get_vertex(&state);
 
         // Simulate the upload of the image texture.
         channel
-            .send(RenderMessage {
-                image_texture,
-                lut_texture,
+            .send(GstRenderMessage {
+                image_texture: image_texture.clone(),
+                lut_texture: lut_texture.clone(),
                 vertex_data,
             })
             .expect("Failed to send textures");
